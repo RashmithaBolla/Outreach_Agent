@@ -213,7 +213,7 @@ export default function Navbar() {
             />
             <div>
               <h4 className="font-semibold text-sm dark:text-white leading-none mb-0.5">
-                Rashmitha
+                Rishika
               </h4>
               <p className="text-xs text-gray-500 dark:text-gray-400">SDR</p>
             </div>

@@ -5,6 +5,20 @@ from typing import Optional, List
 from datetime import datetime
 import random
 import json
+import os
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# Load environment variables from .env
+load_dotenv()
+
+# Initialize OpenAI client (supports OpenRouter via OPENAI_BASE_URL)
+_openai_kwargs = {"api_key": os.getenv("OPENAI_API_KEY")}
+if os.getenv("OPENAI_BASE_URL"):
+    _openai_kwargs["base_url"] = os.getenv("OPENAI_BASE_URL")
+
+client = OpenAI(**_openai_kwargs)
 
 app = FastAPI(title="PipelineIQ API")
 
@@ -229,6 +243,123 @@ def get_or_init_lead(lead_id):
         lead_states[lead_id] = "received"
     return lead_states[lead_id]
 
+# ========== LLM HELPERS ==========
+
+def llm_score_lead(lead: dict) -> dict:
+    """
+    Uses GPT to score a lead from 0-100 based purely on business attributes.
+    Returns a dict with 'score' (int) and 'reasoning' (str).
+    Identity-blind: name and email are excluded from the prompt.
+    """
+    prompt = f"""You are a B2B lead scoring AI. Score this lead from 0 to 100 based ONLY on business attributes.
+Do NOT consider personal attributes like name, gender, nationality, or religion.
+
+Lead data:
+- Role: {lead['role']}
+- Company: {lead['company']}
+- Industry: {lead['industry']}
+- Employees: {lead['employees']}
+- Funding: {lead['funding']}
+- Currently Hiring: {lead['hiring']}
+- Tech Stack: {', '.join(lead['tech_stack'])}
+- Buying Signals: {', '.join(lead['buying_signals'])}
+- Recent News: {lead['recent_news']}
+
+Scoring criteria:
+- Company size (0-25 pts): Larger companies = higher score
+- Role seniority (0-20 pts): C-level/VP/Director = highest
+- Industry fit (0-20 pts): SaaS, Enterprise AI, Cloud, Healthcare AI, Cybersecurity, FinTech = best fit
+- Funding stage (0-20 pts): Series C/D = highest, Pre-seed = lowest
+- Hiring activity (0-15 pts): Actively hiring = full points
+
+Respond ONLY with valid JSON in this exact format:
+{{
+  "score": <integer 0-100>,
+  "reasoning": "<one sentence explaining the score>",
+  "breakdown": {{
+    "company_size": <0-25>,
+    "role_seniority": <0-20>,
+    "industry_fit": <0-20>,
+    "funding_stage": <0-20>,
+    "hiring_activity": <0-15>
+  }}
+}}"""
+
+    response = client.chat.completions.create(
+        model="openai/gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a B2B lead scoring assistant. Always respond with valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2,
+        max_tokens=300
+    )
+
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
+def llm_draft_email(lead: dict, classification: str) -> dict:
+    """
+    Uses GPT to generate a personalized outreach email based on enriched lead data.
+    Returns a dict with 'subject' and 'body'.
+    """
+    prompt = f"""You are an expert B2B sales development representative (SDR).
+Write a personalized cold outreach email for this lead. Use ONLY the facts provided — do not invent anything.
+
+Lead info:
+- First name: {lead['name'].split()[0]}
+- Role: {lead['role']}
+- Company: {lead['company']}
+- Industry: {lead['industry']}
+- Company size: {lead['employees']} employees
+- Funding: {lead['funding']}
+- Hiring: {lead['hiring']}
+- Tech stack: {', '.join(lead['tech_stack'])}
+- Buying signals: {', '.join(lead['buying_signals'])}
+- Recent news: {lead['recent_news']}
+- Lead classification: {classification.upper()}
+
+Email requirements:
+- Subject line: compelling and specific to their situation
+- Opening: reference something specific about their company (use the recent news or buying signals)
+- Body: 2-3 short paragraphs max, conversational tone
+- Clear value proposition relevant to their industry and tech stack
+- Soft CTA: ask for a 15-min call, not a demo
+- Sign off as: PipelineIQ Team
+- No generic filler phrases like "I hope this email finds you well"
+- Total length: under 150 words
+
+Respond ONLY with valid JSON in this exact format:
+{{
+  "subject": "<email subject line>",
+  "body": "<full email body with newlines as \\n>"
+}}"""
+
+    response = client.chat.completions.create(
+        model="openai/gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are an expert SDR writing personalized B2B outreach emails. Always respond with valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7,
+        max_tokens=500
+    )
+
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
 # ========== ENDPOINTS ==========
 
 @app.get("/leads")
@@ -267,10 +398,10 @@ def enrich_lead(action: LeadAction):
     lead = next((l for l in LEADS if l["id"] == action.lead_id), None)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    
+
     lead_enriched.add(action.lead_id)
     lead_states[action.lead_id] = "enriched"
-    
+
     log_entry = {
         "lead_id": action.lead_id,
         "lead_name": lead["name"],
@@ -279,7 +410,7 @@ def enrich_lead(action: LeadAction):
         "timestamp": datetime.now().isoformat()
     }
     lead_logs.append(log_entry)
-    
+
     return {
         "status": "enriched",
         "data": {
@@ -299,104 +430,72 @@ def score_lead(action: LeadAction):
     lead = next((l for l in LEADS if l["id"] == action.lead_id), None)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    
-    # Identity-blind scoring based on business attributes only
-    score = 0
-    
-    # Company size (0-25 points)
-    if lead["employees"] >= 1000:
-        score += 25
-    elif lead["employees"] >= 500:
-        score += 20
-    elif lead["employees"] >= 200:
-        score += 15
-    elif lead["employees"] >= 50:
-        score += 10
-    else:
-        score += 5
-    
-    # Role seniority (0-20 points)
-    c_level_roles = ["CEO", "CTO", "VP", "Director", "Head of"]
-    if any(role in lead["role"] for role in c_level_roles):
-        score += 20
-    elif "Manager" in lead["role"]:
-        score += 15
-    else:
-        score += 10
-    
-    # Industry fit (0-20 points)
-    target_industries = ["SaaS", "Enterprise AI", "Cloud Infrastructure", "Healthcare AI", "Cybersecurity", "FinTech"]
-    if lead["industry"] in target_industries:
-        score += 20
-    elif lead["industry"] in ["Banking", "EdTech"]:
-        score += 15
-    else:
-        score += 5
-    
-    # Hiring activity (0-15 points)
-    if lead["hiring"]:
-        score += 15
-    
-    # Funding (0-20 points)
-    if "Series C" in lead["funding"] or "Series D" in lead["funding"]:
-        score += 20
-    elif "Series B" in lead["funding"]:
-        score += 15
-    elif "Series A" in lead["funding"]:
-        score += 10
-    elif "Seed" in lead["funding"]:
-        score += 5
-    else:
-        score += 3
-    
+
+    try:
+        result = llm_score_lead(lead)
+        score = result["score"]
+        reasoning = result.get("reasoning", "")
+        breakdown = result.get("breakdown", {})
+    except Exception as e:
+        raise HTTPException(500, f"LLM scoring failed: {str(e)}")
+
     lead_scores[action.lead_id] = score
     lead_states[action.lead_id] = "scored"
     lead_scored.add(action.lead_id)
-    
+
+    details = (
+        f"AI Score: {score}/100 — {reasoning} | "
+        f"Breakdown: Company size: {breakdown.get('company_size', '?')}, "
+        f"Role: {breakdown.get('role_seniority', '?')}, "
+        f"Industry: {breakdown.get('industry_fit', '?')}, "
+        f"Funding: {breakdown.get('funding_stage', '?')}, "
+        f"Hiring: {breakdown.get('hiring_activity', '?')}"
+    )
+
     log_entry = {
         "lead_id": action.lead_id,
         "lead_name": lead["name"],
         "action": "scored",
-        "details": f"Score: {score}/100 - Company size: {lead['employees']}, Role: {lead['role']}, Industry: {lead['industry']}",
+        "details": details,
         "score": score,
         "timestamp": datetime.now().isoformat()
     }
     lead_logs.append(log_entry)
-    
-    return {"status": "scored", "score": score}
+
+    return {"status": "scored", "score": score, "reasoning": reasoning, "breakdown": breakdown}
 
 @app.post("/classify")
 def classify_lead(action: LeadAction):
     lead = next((l for l in LEADS if l["id"] == action.lead_id), None)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    
+
     score = lead_scores.get(action.lead_id, 0)
-    
+
     if score >= 80:
         classification = "hot"
-        reason = f"High score ({score}/100): Strong company size, senior role, and industry fit"
+        reason = f"High AI score ({score}/100): Strong company profile and senior role"
     elif score >= 50:
         classification = "nurture"
-        reason = f"Medium score ({score}/100): Good potential but needs more engagement"
+        reason = f"Medium AI score ({score}/100): Good potential but needs more engagement"
     else:
         classification = "disqualified"
-        reason = f"Low score ({score}/100): Below threshold for qualification"
-    
+        reason = f"Low AI score ({score}/100): Below qualification threshold"
+
     lead_classifications[action.lead_id] = {"type": classification, "reason": reason}
     lead_states[action.lead_id] = "classified"
     lead_classified.add(action.lead_id)
-    
+
     log_entry = {
         "lead_id": action.lead_id,
         "lead_name": lead["name"],
         "action": "classified",
-        "details": f"Classified as {classification.upper()} - {reason}",
+        "details": f"Classified as {classification.upper()} — {reason}",
         "classification": classification,
         "timestamp": datetime.now().isoformat()
     }
     lead_logs.append(log_entry)
-    
+
     return {"status": "classified", "classification": classification, "reason": reason}
 
 @app.post("/draft-email")
@@ -404,46 +503,33 @@ def draft_email(action: LeadAction):
     lead = next((l for l in LEADS if l["id"] == action.lead_id), None)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    
+
     classification = lead_classifications.get(action.lead_id, {}).get("type", "nurture")
-    
+
     if classification == "disqualified":
         return {"status": "skipped", "message": "Disqualified leads are not emailed"}
-    
-    # Generate personalized email based on enriched data - never invent facts
-    email_subject = f"Helping {lead['company']} scale their {lead['industry']} infrastructure"
-    
-    hiring_text = "I see you are actively hiring and scaling - " if lead["hiring"] else ""
-    recent_news_text = f" with your recent {lead['recent_news'].lower()}" if lead["recent_news"] else ""
-    buying_signals_text = ", ".join(lead["buying_signals"][:2]).lower()
-    
-    email_body = f"""Hi {lead['name'].split()[0]},
 
-I noticed that {lead['company']} has been making great strides in the {lead['industry']} space{recent_news_text}.
-
-Given your role as {lead['role']}, I thought you might be interested in how we help companies like yours optimize their outreach and lead qualification processes.
-
-{hiring_text}We specialize in helping {lead['industry']} companies with {buying_signals_text}.
-
-Would you be open to a brief conversation next week to explore if there's a fit?
-
-Best regards,
-PipelineIQ Team"""
+    try:
+        result = llm_draft_email(lead, classification)
+        email_subject = result["subject"]
+        email_body = result["body"]
+    except Exception as e:
+        raise HTTPException(500, f"LLM email drafting failed: {str(e)}")
 
     lead_emails[action.lead_id] = {"subject": email_subject, "body": email_body}
     lead_states[action.lead_id] = "drafted"
     lead_drafted.add(action.lead_id)
-    
+
     log_entry = {
         "lead_id": action.lead_id,
         "lead_name": lead["name"],
         "action": "draft_generated",
-        "details": f"Email drafted for {lead['name']}",
+        "details": f"AI-generated email drafted for {lead['name']}",
         "email_subject": email_subject,
         "timestamp": datetime.now().isoformat()
     }
     lead_logs.append(log_entry)
-    
+
     return {"status": "drafted", "subject": email_subject, "body": email_body}
 
 @app.post("/approve")
@@ -451,7 +537,7 @@ def approve_lead(action: ApprovalAction):
     lead = next((l for l in LEADS if l["id"] == action.lead_id), None)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    
+
     if action.action == "approve":
         lead_approved[action.lead_id] = True
         lead_states[action.lead_id] = "approved"
@@ -476,7 +562,7 @@ def approve_lead(action: ApprovalAction):
         }
         lead_logs.append(log_entry)
         return {"status": "rejected", "message": "Email rejected."}
-    
+
     raise HTTPException(400, "Invalid action")
 
 @app.post("/send-email")
@@ -484,12 +570,12 @@ def send_email(action: LeadAction):
     lead = next((l for l in LEADS if l["id"] == action.lead_id), None)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    
+
     if not lead_approved.get(action.lead_id):
         raise HTTPException(400, "Email not approved yet")
-    
+
     lead_states[action.lead_id] = "sent"
-    
+
     log_entry = {
         "lead_id": action.lead_id,
         "lead_name": lead["name"],
@@ -498,7 +584,7 @@ def send_email(action: LeadAction):
         "timestamp": datetime.now().isoformat()
     }
     lead_logs.append(log_entry)
-    
+
     return {"status": "sent", "message": "Email sent successfully"}
 
 @app.get("/logs")
@@ -513,7 +599,7 @@ def get_stats():
     disqualified = sum(1 for c in lead_classifications.values() if c.get("type") == "disqualified")
     approved = sum(1 for v in lead_approved.values() if v)
     sent = sum(1 for s in lead_states.values() if s == "sent")
-    
+
     return {
         "total_leads": total,
         "hot": hot,
