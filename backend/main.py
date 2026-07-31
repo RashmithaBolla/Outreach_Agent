@@ -9,20 +9,57 @@ import json
 import os
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # Load environment variables from .env
 load_dotenv()
 
-# Initialize OpenAI client (supports OpenRouter via OPENAI_BASE_URL)
-_openai_kwargs = {"api_key": os.getenv("OPENAI_API_KEY")}
-if os.getenv("OPENAI_BASE_URL"):
-    _openai_kwargs["base_url"] = os.getenv("OPENAI_BASE_URL")
+# ========== LLM CLIENT SETUP ==========
+# Prefer Google Gemini (free, no rate limits on personal key)
+# Falls back to OpenRouter if GOOGLE_API_KEY is not set
 
-client = OpenAI(**_openai_kwargs)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Free model on OpenRouter (no credits required)
-LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-31b-it:free")
+if GOOGLE_API_KEY:
+    import google.generativeai as genai
+    genai.configure(api_key=GOOGLE_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    USE_GEMINI = True
+else:
+    from openai import OpenAI
+    _openai_kwargs = {"api_key": os.getenv("OPENAI_API_KEY")}
+    if os.getenv("OPENAI_BASE_URL"):
+        _openai_kwargs["base_url"] = os.getenv("OPENAI_BASE_URL")
+    client = OpenAI(**_openai_kwargs)
+    LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-31b-it:free")
+    USE_GEMINI = False
+
+
+def call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.5, max_tokens: int = 500) -> str:
+    """Unified LLM call — uses Gemini if available, otherwise OpenRouter."""
+    if USE_GEMINI:
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        response = gemini_model.generate_content(
+            full_prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens
+            )
+        )
+        return response.text
+    else:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        content = response.choices[0].message.content
+        if content is None:
+            raise Exception(f"Model '{LLM_MODEL}' returned empty content.")
+        return content
 
 app = FastAPI(title="PipelineIQ API")
 
@@ -250,12 +287,9 @@ def get_or_init_lead(lead_id):
 # ========== LLM HELPERS ==========
 
 def llm_score_lead(lead: dict) -> dict:
-    """
-    Uses GPT to score a lead from 0-100 based purely on business attributes.
-    Returns a dict with 'score' (int) and 'reasoning' (str).
-    Identity-blind: name and email are excluded from the prompt.
-    """
-    prompt = f"""You are a B2B lead scoring AI. Score this lead from 0 to 100 based ONLY on business attributes.
+    """Score a lead 0-100 using LLM. Identity-blind."""
+    system_prompt = "You are a B2B lead scoring assistant. Always respond with valid JSON only."
+    user_prompt = f"""Score this lead from 0 to 100 based ONLY on business attributes.
 Do NOT consider personal attributes like name, gender, nationality, or religion.
 
 Lead data:
@@ -290,21 +324,7 @@ Respond ONLY with valid JSON in this exact format:
 }}"""
 
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a B2B lead scoring assistant. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=300
-        )
-
-        raw = response.choices[0].message.content
-        if raw is None:
-            raise Exception(f"Model '{LLM_MODEL}' returned empty content. Try a different model.")
-
-        raw = raw.strip()
+        raw = call_llm(system_prompt, user_prompt, temperature=0.2, max_tokens=300)
         # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -312,16 +332,13 @@ Respond ONLY with valid JSON in this exact format:
                 raw = raw[4:]
         return json.loads(raw.strip())
     except Exception as e:
-        raise Exception(f"LLM API call failed: {str(e)}. Model used: {LLM_MODEL}")
+        raise Exception(f"LLM API call failed: {str(e)}")
 
 
 def llm_draft_email(lead: dict, classification: str) -> dict:
-    """
-    Uses GPT to generate a personalized outreach email based on enriched lead data.
-    Returns a dict with 'subject' and 'body'.
-    """
-    prompt = f"""You are an expert B2B sales development representative (SDR).
-Write a personalized cold outreach email for this lead. Use ONLY the facts provided — do not invent anything.
+    """Generate a personalized outreach email using LLM."""
+    system_prompt = "You are an expert SDR writing personalized B2B outreach emails. Always respond with valid JSON only."
+    user_prompt = f"""Write a personalized cold outreach email for this lead. Use ONLY the facts provided.
 
 Lead info:
 - First name: {lead['name'].split()[0]}
@@ -353,17 +370,7 @@ Respond ONLY with valid JSON in this exact format:
 }}"""
 
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert SDR writing personalized B2B outreach emails. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=500
-        )
-
-        raw = response.choices[0].message.content.strip()
+        raw = call_llm(system_prompt, user_prompt, temperature=0.7, max_tokens=500)
         # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -371,7 +378,7 @@ Respond ONLY with valid JSON in this exact format:
                 raw = raw[4:]
         return json.loads(raw.strip())
     except Exception as e:
-        raise Exception(f"LLM API call failed: {str(e)}. Check API key, model name, and credits.")
+        raise Exception(f"LLM API call failed: {str(e)}")
 
 
 # ========== ENDPOINTS ==========
@@ -380,27 +387,22 @@ Respond ONLY with valid JSON in this exact format:
 def debug_llm():
     """Test LLM connection and return raw response for debugging."""
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "user", "content": "Reply with exactly this JSON: {\"ok\": true}"}
-            ],
-            max_tokens=50
-        )
-        content = response.choices[0].message.content
+        raw = call_llm("You are a helpful assistant.", "Reply with exactly this JSON: {\"ok\": true}", max_tokens=50)
         return {
-            "model_used": LLM_MODEL,
-            "api_key_set": bool(os.getenv("OPENAI_API_KEY")),
-            "base_url": os.getenv("OPENAI_BASE_URL"),
-            "raw_response": content,
-            "finish_reason": response.choices[0].finish_reason
+            "provider": "gemini" if USE_GEMINI else "openrouter",
+            "model": "gemini-2.0-flash" if USE_GEMINI else LLM_MODEL,
+            "google_key_set": bool(GOOGLE_API_KEY),
+            "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
+            "raw_response": raw,
+            "status": "ok"
         }
     except Exception as e:
         return {
-            "model_used": LLM_MODEL,
-            "api_key_set": bool(os.getenv("OPENAI_API_KEY")),
-            "base_url": os.getenv("OPENAI_BASE_URL"),
-            "error": str(e)
+            "provider": "gemini" if USE_GEMINI else "openrouter",
+            "google_key_set": bool(GOOGLE_API_KEY),
+            "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
+            "error": str(e),
+            "status": "error"
         }
 
 @app.get("/leads")
