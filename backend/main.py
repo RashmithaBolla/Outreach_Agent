@@ -20,6 +20,9 @@ if os.getenv("OPENAI_BASE_URL"):
 
 client = OpenAI(**_openai_kwargs)
 
+# Free model on OpenRouter (no credits required)
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+
 app = FastAPI(title="PipelineIQ API")
 
 app.add_middleware(
@@ -285,23 +288,27 @@ Respond ONLY with valid JSON in this exact format:
   }}
 }}"""
 
-    response = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a B2B lead scoring assistant. Always respond with valid JSON only."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=300
-    )
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a B2B lead scoring assistant. Always respond with valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=300
+        )
 
-    raw = response.choices[0].message.content.strip()
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        # Return detailed error for debugging
+        raise Exception(f"LLM API call failed: {str(e)}. Check API key, model name, and credits.")
 
 
 def llm_draft_email(lead: dict, classification: str) -> dict:
@@ -341,23 +348,26 @@ Respond ONLY with valid JSON in this exact format:
   "body": "<full email body with newlines as \\n>"
 }}"""
 
-    response = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are an expert SDR writing personalized B2B outreach emails. Always respond with valid JSON only."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7,
-        max_tokens=500
-    )
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You are an expert SDR writing personalized B2B outreach emails. Always respond with valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
 
-    raw = response.choices[0].message.content.strip()
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        raise Exception(f"LLM API call failed: {str(e)}. Check API key, model name, and credits.")
 
 
 # ========== ENDPOINTS ==========
