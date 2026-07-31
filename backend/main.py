@@ -21,7 +21,7 @@ if os.getenv("OPENAI_BASE_URL"):
 client = OpenAI(**_openai_kwargs)
 
 # Free model on OpenRouter (no credits required)
-LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-31b-it:free")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b:free")
 
 app = FastAPI(title="PipelineIQ API")
 
