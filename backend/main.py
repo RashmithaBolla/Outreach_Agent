@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -299,7 +300,11 @@ Respond ONLY with valid JSON in this exact format:
             max_tokens=300
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content
+        if raw is None:
+            raise Exception(f"Model '{LLM_MODEL}' returned empty content. Try a different model.")
+
+        raw = raw.strip()
         # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -307,8 +312,7 @@ Respond ONLY with valid JSON in this exact format:
                 raw = raw[4:]
         return json.loads(raw.strip())
     except Exception as e:
-        # Return detailed error for debugging
-        raise Exception(f"LLM API call failed: {str(e)}. Check API key, model name, and credits.")
+        raise Exception(f"LLM API call failed: {str(e)}. Model used: {LLM_MODEL}")
 
 
 def llm_draft_email(lead: dict, classification: str) -> dict:
@@ -371,6 +375,33 @@ Respond ONLY with valid JSON in this exact format:
 
 
 # ========== ENDPOINTS ==========
+
+@app.get("/debug-llm")
+def debug_llm():
+    """Test LLM connection and return raw response for debugging."""
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "user", "content": "Reply with exactly this JSON: {\"ok\": true}"}
+            ],
+            max_tokens=50
+        )
+        content = response.choices[0].message.content
+        return {
+            "model_used": LLM_MODEL,
+            "api_key_set": bool(os.getenv("OPENAI_API_KEY")),
+            "base_url": os.getenv("OPENAI_BASE_URL"),
+            "raw_response": content,
+            "finish_reason": response.choices[0].finish_reason
+        }
+    except Exception as e:
+        return {
+            "model_used": LLM_MODEL,
+            "api_key_set": bool(os.getenv("OPENAI_API_KEY")),
+            "base_url": os.getenv("OPENAI_BASE_URL"),
+            "error": str(e)
+        }
 
 @app.get("/leads")
 def get_leads():
